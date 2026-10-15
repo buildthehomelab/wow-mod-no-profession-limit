@@ -124,6 +124,8 @@ NoProfessionLimit.AccountBound.StartupBackfill = 0
 
 #
 # Sync missing account-bound profession data when a character logs in.
+# The account data is read asynchronously, so it is applied a moment after
+# the character enters the world. Playerbot sessions are skipped.
 #
 # Default: 1
 
@@ -132,6 +134,10 @@ NoProfessionLimit.AccountBound.SyncOnLogin = 1
 #
 # When a character learns a profession/recipe or gains profession skill,
 # write that progress to other eligible characters on the same account.
+#
+# Progress is collected while the character plays and written in one
+# asynchronous transaction when the character is saved (autosave or logout).
+# Playerbot sessions are skipped.
 #
 # Online target characters may need to relog to see DB-written changes.
 #
