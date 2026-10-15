@@ -3,6 +3,7 @@
  */
 
 #include "Config.h"
+#include "DataMap.h"
 #include "DatabaseEnv.h"
 #include "DBCEnums.h"
 #include "DBCStores.h"
@@ -18,11 +19,13 @@
 #include "World.h"
 #include "WorldConfig.h"
 #include "WorldScript.h"
+#include "WorldSession.h"
 #include "WorldSessionMgr.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -77,6 +80,42 @@ struct SkillSnapshot
     uint16 Max = 0;
 };
 
+struct SpellRow
+{
+    uint8 Race = 0;
+    uint32 SpellId = 0;
+};
+
+struct SkillRow
+{
+    uint8 Race = 0;
+    uint32 SkillId = 0;
+    uint16 Value = 0;
+    uint16 Max = 0;
+};
+
+// Rows read asynchronously when a character logs in (or on config reload).
+struct AccountLoadResult
+{
+    bool ApplySnapshot = false;
+    std::vector<CharacterInfo> Characters;
+    std::vector<SpellRow> SpellRows;
+    std::vector<SkillRow> SkillRows;
+};
+
+// Per-character sync state, kept in Player::CustomData. Only the thread that
+// updates the player touches it, so it needs no lock.
+struct AccountSyncState : public DataMap::Base
+{
+    bool Applying = false;
+    bool CharactersLoaded = false;
+    std::vector<CharacterInfo> Characters;
+    std::unordered_set<uint32> PendingSpells;
+    std::unordered_set<uint32> PendingSkills;
+};
+
+constexpr char const* AccountSyncStateKey = "NoProfessionLimit.AccountSync";
+
 struct ModuleConfig
 {
     bool Enabled = true;
@@ -104,7 +143,6 @@ struct ModuleConfig
 };
 
 ModuleConfig Config;
-std::unordered_set<uint32> ApplyingAccountSyncGuids;
 
 std::string NormalizeToken(std::string_view token)
 {
@@ -469,23 +507,29 @@ std::string BuildManagedSkillSqlList()
     return result;
 }
 
-std::vector<CharacterInfo> LoadAccountCharacters(uint32 accountId)
+bool IsAccountSyncEnabled()
 {
-    std::vector<CharacterInfo> characters;
+    return Config.Enabled && Config.AccountBoundEnabled;
+}
 
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT guid, account, race, class FROM characters WHERE account = {}", accountId);
+// Playerbots (random bots and alt bots) run on headless sessions. Their
+// factory teaches hundreds of recipes, so they never take part in the sync.
+bool IsBotSession(Player const* player)
+{
+    WorldSession* session = player->GetSession();
+    return !session || session->IsHeadless();
+}
 
+void ReadAccountCharacters(QueryResult const& result, std::vector<CharacterInfo>& characters)
+{
     if (!result)
-        return characters;
+        return;
 
     do
     {
         Field* fields = result->Fetch();
         characters.push_back({ fields[0].Get<uint32>(), fields[1].Get<uint32>(), fields[2].Get<uint8>(), fields[3].Get<uint8>() });
     } while (result->NextRow());
-
-    return characters;
 }
 
 uint32 GetConfiguredMaxPrimaryProfessions()
@@ -568,7 +612,7 @@ void AppendOrCommit(CharacterDatabaseTransaction& trans, std::string_view sql)
 
     if (trans->GetSize() >= 1000)
     {
-        CharacterDatabase.DirectCommitTransaction(trans);
+        CharacterDatabase.CommitTransaction(trans);
         trans = CharacterDatabase.BeginTransaction();
     }
 }
@@ -576,7 +620,7 @@ void AppendOrCommit(CharacterDatabaseTransaction& trans, std::string_view sql)
 void CommitIfNeeded(CharacterDatabaseTransaction& trans)
 {
     if (trans && trans->GetSize())
-        CharacterDatabase.DirectCommitTransaction(trans);
+        CharacterDatabase.CommitTransaction(trans);
 }
 
 void InsertOrUpdateSkillForCharacter(CharacterDatabaseTransaction& trans, uint32 targetGuid, uint32 skillId, uint16 value, uint16 max)
@@ -597,84 +641,49 @@ void InsertSpellForCharacter(CharacterDatabaseTransaction& trans, uint32 targetG
         targetGuid, spellId, uint32(SPEC_MASK_ALL)));
 }
 
-std::unordered_map<uint32, SkillSnapshot> LoadAccountProfessionSkills(Player* player)
+std::unordered_map<uint32, SkillSnapshot> BuildSkillSnapshots(Player* player, std::vector<SkillRow> const& rows)
 {
     std::unordered_map<uint32, SkillSnapshot> snapshots;
-
-    if (!player || !Config.AccountBoundSyncSkillProgress)
-        return snapshots;
-
-    std::string const skillSqlList = BuildManagedSkillSqlList();
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT c.race, cs.skill, cs.value, cs.max "
-        "FROM character_skills cs "
-        "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {} AND cs.skill IN ({})",
-        player->GetSession()->GetAccountId(), skillSqlList);
-
-    if (!result)
-        return snapshots;
-
     uint8 const targetRace = player->getRace(true);
 
-    do
+    for (SkillRow const& row : rows)
     {
-        Field* fields = result->Fetch();
-        uint8 const sourceRace = fields[0].Get<uint8>();
-        uint32 const skillId = fields[1].Get<uint16>();
-        uint16 value = ClampSyncedSkillValue(fields[2].Get<uint16>());
-        uint16 max = ClampSyncedSkillValue(fields[3].Get<uint16>());
+        uint16 value = ClampSyncedSkillValue(row.Value);
+        uint16 max = ClampSyncedSkillValue(row.Max);
 
-        if (!IsManagedProfessionSkill(skillId) || !CanShareBetweenRaces(sourceRace, targetRace))
+        if (!IsManagedProfessionSkill(row.SkillId) || !CanShareBetweenRaces(row.Race, targetRace))
             continue;
 
         if (max < value)
             max = value;
 
-        SkillSnapshot& snapshot = snapshots[skillId];
+        SkillSnapshot& snapshot = snapshots[row.SkillId];
         snapshot.Value = std::max(snapshot.Value, value);
         snapshot.Max = std::max(snapshot.Max, max);
-    } while (result->NextRow());
+    }
 
     return snapshots;
 }
 
-void LoadAccountProfessionSpells(Player* player, std::vector<uint32>& rankSpells, std::vector<uint32>& recipeSpells)
+void SplitAccountProfessionSpells(Player* player, std::vector<SpellRow> const& rows, std::vector<uint32>& rankSpells, std::vector<uint32>& recipeSpells)
 {
-    if (!player)
-        return;
-
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT DISTINCT c.race, c.class, cs.spell "
-        "FROM character_spell cs "
-        "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {}",
-        player->GetSession()->GetAccountId());
-
-    if (!result)
-        return;
-
     uint8 const targetRace = player->getRace(true);
     std::unordered_set<uint32> seenRankSpells;
     std::unordered_set<uint32> seenRecipeSpells;
 
-    do
+    for (SpellRow const& row : rows)
     {
-        Field* fields = result->Fetch();
-        uint8 const sourceRace = fields[0].Get<uint8>();
-        uint32 const spellId = fields[2].Get<uint32>();
-
-        if (!CanShareBetweenRaces(sourceRace, targetRace) || !IsAccountBoundProfessionSpell(spellId))
+        if (!CanShareBetweenRaces(row.Race, targetRace) || !IsAccountBoundProfessionSpell(row.SpellId))
             continue;
 
-        if (GetProfessionSkillFromRankSpell(spellId))
+        if (GetProfessionSkillFromRankSpell(row.SpellId))
         {
-            if (seenRankSpells.insert(spellId).second)
-                rankSpells.push_back(spellId);
+            if (seenRankSpells.insert(row.SpellId).second)
+                rankSpells.push_back(row.SpellId);
         }
-        else if (seenRecipeSpells.insert(spellId).second)
-            recipeSpells.push_back(spellId);
-    } while (result->NextRow());
+        else if (seenRecipeSpells.insert(row.SpellId).second)
+            recipeSpells.push_back(row.SpellId);
+    }
 }
 
 bool ApplySkillSnapshot(Player* player, uint32 skillId, SkillSnapshot const& snapshot)
@@ -705,13 +714,10 @@ bool ApplySkillSnapshot(Player* player, uint32 skillId, SkillSnapshot const& sna
     return true;
 }
 
-void ApplyAccountSyncToPlayer(Player* player)
+void ApplyAccountSnapshot(Player* player, AccountSyncState& state, AccountLoadResult const& data)
 {
-    if (!Config.Enabled || !Config.AccountBoundEnabled || !Config.AccountBoundSyncOnLogin || !player)
-        return;
-
     uint32 const playerGuid = player->GetGUID().GetCounter();
-    ApplyingAccountSyncGuids.insert(playerGuid);
+    state.Applying = true;
 
     uint32 learnedRanks = 0;
     uint32 updatedSkills = 0;
@@ -719,7 +725,7 @@ void ApplyAccountSyncToPlayer(Player* player)
 
     std::vector<uint32> rankSpells;
     std::vector<uint32> recipeSpells;
-    LoadAccountProfessionSpells(player, rankSpells, recipeSpells);
+    SplitAccountProfessionSpells(player, data.SpellRows, rankSpells, recipeSpells);
 
     for (uint32 spellId : rankSpells)
     {
@@ -730,7 +736,7 @@ void ApplyAccountSyncToPlayer(Player* player)
         ++learnedRanks;
     }
 
-    for (auto const& [skillId, snapshot] : LoadAccountProfessionSkills(player))
+    for (auto const& [skillId, snapshot] : BuildSkillSnapshots(player, data.SkillRows))
         if (ApplySkillSnapshot(player, skillId, snapshot))
             ++updatedSkills;
 
@@ -743,91 +749,237 @@ void ApplyAccountSyncToPlayer(Player* player)
         ++learnedRecipes;
     }
 
-    ApplyingAccountSyncGuids.erase(playerGuid);
+    state.Applying = false;
 
     if (learnedRanks || updatedSkills || learnedRecipes)
         LOG_INFO("module.noprofessionlimit", "NoProfessionLimit: account sync applied to player {} (ranks={}, skills={}, recipes={}).",
             playerGuid, learnedRanks, updatedSkills, learnedRecipes);
 }
 
-void SyncSkillToAccount(Player* player, uint32 skillId)
+// Runs from the session's query callbacks, on the thread that updates the player.
+void FinishAccountLoad(WorldSession* session, ObjectGuid guid, AccountLoadResult& data)
 {
-    if (!Config.Enabled || !Config.AccountBoundEnabled || !Config.AccountBoundSyncOnLearn || !Config.AccountBoundSyncSkillProgress || !player)
+    Player* player = session->GetPlayer();
+    if (!player || player->GetGUID() != guid)
         return;
 
-    if (ApplyingAccountSyncGuids.contains(player->GetGUID().GetCounter()) || !IsManagedProfessionSkill(skillId))
-        return;
+    AccountSyncState* state = player->CustomData.GetDefault<AccountSyncState>(AccountSyncStateKey);
+    state->Characters = std::move(data.Characters);
+    state->CharactersLoaded = true;
 
-    uint16 value = ClampSyncedSkillValue(player->GetPureSkillValue(skillId));
-    uint16 max = ClampSyncedSkillValue(player->GetPureMaxSkillValue(skillId));
-    if (!value || !max)
-        return;
-
-    if (max < value)
-        max = value;
-
-    std::vector<CharacterInfo> characters = LoadAccountCharacters(player->GetSession()->GetAccountId());
-    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-    uint32 synced = 0;
-    uint32 const sourceGuid = player->GetGUID().GetCounter();
-    uint8 const sourceRace = player->getRace(true);
-
-    for (CharacterInfo const& target : characters)
+    if (data.ApplySnapshot)
     {
-        if (target.Guid == sourceGuid || !CanShareBetweenRaces(sourceRace, target.Race))
-            continue;
-
-        if (!GetSkillRaceClassInfo(skillId, target.Race, target.Class))
-            continue;
-
-        InsertOrUpdateSkillForCharacter(trans, target.Guid, skillId, value, max);
-
-        if (Config.AccountBoundSyncProfessionRanks)
-            if (uint32 rankSpell = GetBestRankSpellForSkill(skillId, max))
-                if (!Config.SpellBlockList.contains(rankSpell) && IsSpellAllowedForTargetCharacter(rankSpell, target))
-                    InsertSpellForCharacter(trans, target.Guid, rankSpell);
-
-        ++synced;
+        ApplyAccountSnapshot(player, *state, data);
+        NormalizeFreeProfessionPoints(player);
     }
-
-    CommitIfNeeded(trans);
-
-    if (synced)
-        LOG_DEBUG("module.noprofessionlimit", "NoProfessionLimit: synced skill {} from player {} to {} account character(s).",
-            skillId, sourceGuid, synced);
 }
 
-void SyncSpellToAccount(Player* player, uint32 spellId)
+// Loads the account's characters (needed to push progress later) and, when
+// applySnapshot is set, the account's profession spells and skills, then
+// applies them. All reads are async; nothing blocks the world thread.
+void QueueAccountLoad(Player* player, bool applySnapshot)
 {
-    if (!Config.Enabled || !Config.AccountBoundEnabled || !Config.AccountBoundSyncOnLearn || !player)
+    if (!IsAccountSyncEnabled() || !player || IsBotSession(player))
         return;
 
-    if (ApplyingAccountSyncGuids.contains(player->GetGUID().GetCounter()) || !IsAccountBoundProfessionSpell(spellId))
+    if (!applySnapshot && !Config.AccountBoundSyncOnLearn)
         return;
 
-    std::vector<CharacterInfo> characters = LoadAccountCharacters(player->GetSession()->GetAccountId());
-    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-    uint32 synced = 0;
-    uint32 const sourceGuid = player->GetGUID().GetCounter();
-    uint8 const sourceRace = player->getRace(true);
+    WorldSession* session = player->GetSession();
+    ObjectGuid const guid = player->GetGUID();
+    uint32 const accountId = session->GetAccountId();
 
-    for (CharacterInfo const& target : characters)
+    auto data = std::make_shared<AccountLoadResult>();
+    data->ApplySnapshot = applySnapshot;
+
+    std::string const spellSql = Acore::StringFormat(
+        "SELECT DISTINCT c.race, cs.spell "
+        "FROM character_spell cs "
+        "INNER JOIN characters c ON c.guid = cs.guid "
+        "WHERE c.account = {}",
+        accountId);
+
+    std::string const skillSql = Acore::StringFormat(
+        "SELECT c.race, cs.skill, cs.value, cs.max "
+        "FROM character_skills cs "
+        "INNER JOIN characters c ON c.guid = cs.guid "
+        "WHERE c.account = {} AND cs.skill IN ({})",
+        accountId, BuildManagedSkillSqlList());
+
+    session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(Acore::StringFormat(
+        "SELECT guid, account, race, class FROM characters WHERE account = {}", accountId))
+        .WithChainingCallback([session, guid, data, spellSql](QueryCallback& callback, QueryResult result)
+        {
+            ReadAccountCharacters(result, data->Characters);
+
+            if (data->ApplySnapshot)
+                callback.SetNextQuery(CharacterDatabase.AsyncQuery(spellSql));
+            else
+                FinishAccountLoad(session, guid, *data);
+        })
+        .WithChainingCallback([session, guid, data, skillSql](QueryCallback& callback, QueryResult result)
+        {
+            if (result)
+            {
+                do
+                {
+                    Field* fields = result->Fetch();
+                    data->SpellRows.push_back({ fields[0].Get<uint8>(), fields[1].Get<uint32>() });
+                } while (result->NextRow());
+            }
+
+            if (Config.AccountBoundSyncSkillProgress)
+                callback.SetNextQuery(CharacterDatabase.AsyncQuery(skillSql));
+            else
+                FinishAccountLoad(session, guid, *data);
+        })
+        .WithCallback([session, guid, data](QueryResult result)
+        {
+            if (result)
+            {
+                do
+                {
+                    Field* fields = result->Fetch();
+                    data->SkillRows.push_back({ fields[0].Get<uint8>(), uint32(fields[1].Get<uint16>()), fields[2].Get<uint16>(), fields[3].Get<uint16>() });
+                } while (result->NextRow());
+            }
+
+            FinishAccountLoad(session, guid, *data);
+        }));
+}
+
+// Returns the state to record learned progress in, or nullptr when this
+// player's progress is not pushed to the account.
+AccountSyncState* GetPushState(Player* player)
+{
+    if (!IsAccountSyncEnabled() || !Config.AccountBoundSyncOnLearn || !player || IsBotSession(player))
+        return nullptr;
+
+    AccountSyncState* state = player->CustomData.GetDefault<AccountSyncState>(AccountSyncStateKey);
+    return state->Applying ? nullptr : state;
+}
+
+void QueueSkillForAccount(Player* player, uint32 skillId)
+{
+    if (!Config.AccountBoundSyncSkillProgress || !IsManagedProfessionSkill(skillId))
+        return;
+
+    if (AccountSyncState* state = GetPushState(player))
+        state->PendingSkills.insert(skillId);
+}
+
+void QueueSpellForAccount(Player* player, uint32 spellId)
+{
+    AccountSyncState* state = GetPushState(player);
+    if (state && IsAccountBoundProfessionSpell(spellId))
+        state->PendingSpells.insert(spellId);
+}
+
+// Writes the progress learned since the last save to the account's other
+// characters, as one async transaction. Called on every character save
+// (autosave and logout), so a burst of learned recipes costs one commit.
+void FlushAccountSync(Player* player, bool logout)
+{
+    if (!player)
+        return;
+
+    AccountSyncState* state = player->CustomData.Get<AccountSyncState>(AccountSyncStateKey);
+    if (!state || (state->PendingSpells.empty() && state->PendingSkills.empty()))
+        return;
+
+    // A config reload turned pushing off since these were queued.
+    if (!IsAccountSyncEnabled() || !Config.AccountBoundSyncOnLearn)
     {
-        if (target.Guid == sourceGuid || !CanShareBetweenRaces(sourceRace, target.Race))
-            continue;
-
-        if (!IsSpellAllowedForTargetCharacter(spellId, target))
-            continue;
-
-        InsertSpellForCharacter(trans, target.Guid, spellId);
-        ++synced;
+        state->PendingSpells.clear();
+        state->PendingSkills.clear();
+        return;
     }
 
-    CommitIfNeeded(trans);
+    // The login load has not returned yet. Keep the queue for the next save, or, when
+    // the character is logging out, read the character list now (rare, one query).
+    if (!state->CharactersLoaded)
+    {
+        if (!logout)
+            return;
 
-    if (synced)
-        LOG_DEBUG("module.noprofessionlimit", "NoProfessionLimit: synced profession spell {} from player {} to {} account character(s).",
-            spellId, sourceGuid, synced);
+        if (QueryResult result = CharacterDatabase.Query(
+            "SELECT guid, account, race, class FROM characters WHERE account = {}", player->GetSession()->GetAccountId()))
+            ReadAccountCharacters(result, state->Characters);
+
+        state->CharactersLoaded = true;
+    }
+
+    uint32 const sourceGuid = player->GetGUID().GetCounter();
+    uint8 const sourceRace = player->getRace(true);
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+    for (uint32 skillId : state->PendingSkills)
+    {
+        // Re-check against the current config: a reload may have changed it since.
+        if (!Config.AccountBoundSyncSkillProgress || !IsManagedProfessionSkill(skillId))
+            continue;
+
+        uint16 value = ClampSyncedSkillValue(player->GetPureSkillValue(skillId));
+        uint16 max = ClampSyncedSkillValue(player->GetPureMaxSkillValue(skillId));
+        if (!value || !max)
+            continue;
+
+        if (max < value)
+            max = value;
+
+        for (CharacterInfo const& target : state->Characters)
+        {
+            if (target.Guid == sourceGuid || !CanShareBetweenRaces(sourceRace, target.Race))
+                continue;
+
+            if (!GetSkillRaceClassInfo(skillId, target.Race, target.Class))
+                continue;
+
+            InsertOrUpdateSkillForCharacter(trans, target.Guid, skillId, value, max);
+
+            if (Config.AccountBoundSyncProfessionRanks)
+                if (uint32 rankSpell = GetBestRankSpellForSkill(skillId, max))
+                    if (!Config.SpellBlockList.contains(rankSpell) && IsSpellAllowedForTargetCharacter(rankSpell, target))
+                        InsertSpellForCharacter(trans, target.Guid, rankSpell);
+        }
+    }
+
+    for (uint32 spellId : state->PendingSpells)
+    {
+        // Skip spells that were removed again since (for example by EnforceAllowedList),
+        // or that a config reload no longer syncs.
+        if (!player->HasSpell(spellId) || !IsAccountBoundProfessionSpell(spellId))
+            continue;
+
+        for (CharacterInfo const& target : state->Characters)
+        {
+            if (target.Guid == sourceGuid || !CanShareBetweenRaces(sourceRace, target.Race))
+                continue;
+
+            if (!IsSpellAllowedForTargetCharacter(spellId, target))
+                continue;
+
+            InsertSpellForCharacter(trans, target.Guid, spellId);
+        }
+    }
+
+    LOG_DEBUG("module.noprofessionlimit", "NoProfessionLimit: pushing {} skill(s) and {} spell(s) from player {} to the account.",
+        state->PendingSkills.size(), state->PendingSpells.size(), sourceGuid);
+
+    state->PendingSkills.clear();
+    state->PendingSpells.clear();
+
+    // At logout the push must be in the database before the next character on the
+    // account loads: async tasks on several database workers are not ordered, and
+    // that character's own save would overwrite a skill row pushed after its load.
+    // This is one blocking commit per logout, and only when something was learned.
+    if (logout)
+    {
+        if (trans->GetSize())
+            CharacterDatabase.DirectCommitTransaction(trans);
+    }
+    else
+        CommitIfNeeded(trans);
 }
 
 std::unordered_map<uint32, std::vector<CharacterInfo>> LoadAllCharactersByAccount()
@@ -1017,8 +1169,9 @@ public:
                 EnforceAllowedProfessions(player);
                 NormalizeFreeProfessionPoints(player);
 
-                if (Config.AccountBoundSyncOnlineOnReload)
-                    ApplyAccountSyncToPlayer(player);
+                // Reloads the account's character list and re-applies the
+                // account snapshot when SyncOnlineOnReload is set.
+                QueueAccountLoad(player, Config.AccountBoundSyncOnLogin && Config.AccountBoundSyncOnlineOnReload);
             });
         }
 
@@ -1044,6 +1197,8 @@ class NoProfessionLimitPlayerScript : public PlayerScript
 public:
     NoProfessionLimitPlayerScript() : PlayerScript("NoProfessionLimitPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_SAVE,
         PLAYERHOOK_ON_LEARN_SPELL,
         PLAYERHOOK_ON_SET_SKILL
     }) { }
@@ -1051,8 +1206,22 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         EnforceAllowedProfessions(player);
-        ApplyAccountSyncToPlayer(player);
+        QueueAccountLoad(player, Config.AccountBoundSyncOnLogin);
         NormalizeFreeProfessionPoints(player);
+    }
+
+    void OnPlayerSave(Player* player) override
+    {
+        // The logout save is followed by OnPlayerLogout, which commits directly.
+        if (player->GetSession()->PlayerLogout())
+            return;
+
+        FlushAccountSync(player, false);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        FlushAccountSync(player, true);
     }
 
     void OnPlayerLearnSpell(Player* player, uint32 spellId) override
@@ -1065,7 +1234,7 @@ public:
                 if (IsSupportedPrimarySkill(skillId) && !IsAllowedPrimarySkill(skillId))
                     player->removeSpell(spellId, SPEC_MASK_ALL, false);
 
-        SyncSpellToAccount(player, spellId);
+        QueueSpellForAccount(player, spellId);
         NormalizeFreeProfessionPoints(player);
     }
 
@@ -1083,7 +1252,7 @@ public:
             return;
         }
 
-        SyncSkillToAccount(player, skillId);
+        QueueSkillForAccount(player, skillId);
         NormalizeFreeProfessionPoints(player);
     }
 };
