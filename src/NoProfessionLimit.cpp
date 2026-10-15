@@ -915,6 +915,10 @@ void FlushAccountSync(Player* player, bool logout)
 
     for (uint32 skillId : state->PendingSkills)
     {
+        // Re-check against the current config: a reload may have changed it since.
+        if (!Config.AccountBoundSyncSkillProgress || !IsManagedProfessionSkill(skillId))
+            continue;
+
         uint16 value = ClampSyncedSkillValue(player->GetPureSkillValue(skillId));
         uint16 max = ClampSyncedSkillValue(player->GetPureMaxSkillValue(skillId));
         if (!value || !max)
@@ -942,8 +946,9 @@ void FlushAccountSync(Player* player, bool logout)
 
     for (uint32 spellId : state->PendingSpells)
     {
-        // Skip spells that were removed again since (for example by EnforceAllowedList).
-        if (!player->HasSpell(spellId))
+        // Skip spells that were removed again since (for example by EnforceAllowedList),
+        // or that a config reload no longer syncs.
+        if (!player->HasSpell(spellId) || !IsAccountBoundProfessionSpell(spellId))
             continue;
 
         for (CharacterInfo const& target : state->Characters)
@@ -963,7 +968,18 @@ void FlushAccountSync(Player* player, bool logout)
 
     state->PendingSkills.clear();
     state->PendingSpells.clear();
-    CommitIfNeeded(trans);
+
+    // At logout the push must be in the database before the next character on the
+    // account loads: async tasks on several database workers are not ordered, and
+    // that character's own save would overwrite a skill row pushed after its load.
+    // This is one blocking commit per logout, and only when something was learned.
+    if (logout)
+    {
+        if (trans->GetSize())
+            CharacterDatabase.DirectCommitTransaction(trans);
+    }
+    else
+        CommitIfNeeded(trans);
 }
 
 std::unordered_map<uint32, std::vector<CharacterInfo>> LoadAllCharactersByAccount()
@@ -1196,6 +1212,10 @@ public:
 
     void OnPlayerSave(Player* player) override
     {
+        // The logout save is followed by OnPlayerLogout, which commits directly.
+        if (player->GetSession()->PlayerLogout())
+            return;
+
         FlushAccountSync(player, false);
     }
 

@@ -136,8 +136,11 @@ NoProfessionLimit.AccountBound.SyncOnLogin = 1
 # write that progress to other eligible characters on the same account.
 #
 # Progress is collected while the character plays and written in one
-# asynchronous transaction when the character is saved (autosave or logout).
-# Playerbot sessions are skipped.
+# transaction when the character is saved: asynchronous on autosave, written
+# directly on logout so the next character on the account sees it.
+# Playerbot sessions are skipped, including your own characters played as
+# bots, so recipes they learn are not pushed (they are picked up when another
+# character on the account logs in).
 #
 # Online target characters may need to relog to see DB-written changes.
 #
