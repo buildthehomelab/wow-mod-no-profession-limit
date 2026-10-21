@@ -54,7 +54,7 @@ When account-bound mode is enabled:
 1. Place the module in `azerothcore-wotlk/modules/`:
    ```bash
    cd azerothcore-wotlk/modules
-   git clone https://github.com/AlsoNotMehh/mod-no-profession-limit.git
+   git clone https://github.com/buildthehomelab/wow-mod-no-profession-limit.git mod-no-profession-limit
    ```
 
 2. Re-run CMake and compile your server:
