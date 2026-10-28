@@ -2,6 +2,8 @@
  * NoProfessionLimit module for AzerothCore.
  */
 
+#include "AchievementMgr.h"
+#include "AchievementScript.h"
 #include "Config.h"
 #include "DataMap.h"
 #include "DatabaseEnv.h"
@@ -387,6 +389,89 @@ uint32 GetBestRankSpellForSkill(uint32 skillId, uint16 maxValue)
         rankIndex = 1;
 
     return profession->RankSpells[rankIndex];
+}
+
+// Loaded once at startup; immutable while player threads evaluate achievements.
+std::unordered_map<uint32, uint8> ProfessionTrainerLevels;
+
+void LoadProfessionTrainerLevels()
+{
+    ProfessionTrainerLevels.clear();
+    if (QueryResult result = WorldDatabase.Query("SELECT SpellId, MIN(ReqLevel) FROM trainer_spell GROUP BY SpellId"))
+    {
+        auto record = [](uint32 spellId, uint8 level)
+        {
+            if (!GetProfessionSkillFromRankSpell(spellId, false))
+                return;
+            auto [itr, inserted] = ProfessionTrainerLevels.emplace(spellId, level);
+            if (!inserted)
+                itr->second = std::min(itr->second, level);
+        };
+        do
+        {
+            Field* fields = result->Fetch();
+            uint32 spellId = fields[0].Get<uint32>();
+            uint8 level = fields[1].Get<uint8>();
+            record(spellId, level);
+            // Trainers may cast a wrapper which teaches the actual rank spell.
+            if (SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId))
+                for (SpellEffectInfo const& effect : spell->Effects)
+                    if (effect.Effect == SPELL_EFFECT_LEARN_SPELL)
+                        record(effect.TriggerSpell, level);
+        } while (result->NextRow());
+    }
+}
+
+bool MeetsProfessionAchievementLevel(Player* player, AchievementCriteriaEntry const* criteria)
+{
+    if (!Config.Enabled || !Config.AccountBoundEnabled)
+        return true;
+
+    uint32 skillId;
+    uint32 requiredValue;
+    if (criteria->requiredType == ACHIEVEMENT_CRITERIA_TYPE_REACH_SKILL_LEVEL)
+    {
+        skillId = criteria->reach_skill_level.skillID;
+        requiredValue = criteria->reach_skill_level.skillLevel;
+    }
+    else if (criteria->requiredType == ACHIEVEMENT_CRITERIA_TYPE_LEARN_SKILL_LEVEL)
+    {
+        skillId = criteria->learn_skill_level.skillID;
+        requiredValue = criteria->learn_skill_level.skillLevel * 75;
+    }
+    else
+        return true;
+
+    if (!IsManagedProfessionSkill(skillId))
+        return true;
+
+    // Select the rank which permits this achievement's threshold, not the account's maximum.
+    uint32 spellId = GetBestRankSpellForSkill(skillId, uint16(std::min(requiredValue, uint32(450))));
+    auto itr = ProfessionTrainerLevels.find(spellId);
+    // Missing trainer data must not award an unreachable rank to a fresh character.
+    return itr != ProfessionTrainerLevels.end() && player->GetLevel() >= itr->second;
+}
+
+void RefreshProfessionAchievements(Player* player)
+{
+    if (!Config.Enabled || !Config.AccountBoundEnabled)
+        return;
+
+    for (AchievementCriteriaTypes type : { ACHIEVEMENT_CRITERIA_TYPE_REACH_SKILL_LEVEL,
+        ACHIEVEMENT_CRITERIA_TYPE_LEARN_SKILL_LEVEL })
+    {
+        // Core skips already-complete criteria even when their achievement is still unawarded.
+        // Rebuild only unawarded profession counters from the character's current synced skill.
+        if (auto const* criteria = sAchievementMgr->GetAchievementCriteriaByType(type))
+            for (auto const* entry : *criteria)
+            {
+                uint32 skillId = type == ACHIEVEMENT_CRITERIA_TYPE_REACH_SKILL_LEVEL
+                    ? entry->reach_skill_level.skillID : entry->learn_skill_level.skillID;
+                if (IsManagedProfessionSkill(skillId) && !player->HasAchieved(entry->referredAchievement))
+                    player->GetAchievementMgr()->RemoveCriteriaProgress(entry);
+            }
+        player->UpdateAchievementCriteria(type);
+    }
 }
 
 bool IsSpellAllowedForTargetCharacter(uint32 spellId, CharacterInfo const& target)
@@ -1188,6 +1273,7 @@ public:
     void OnStartup() override
     {
         ApplyWorldProfessionLimit();
+        LoadProfessionTrainerLevels();
         BackfillAccountBoundProfessions();
     }
 };
@@ -1200,7 +1286,9 @@ public:
         PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_ON_SAVE,
         PLAYERHOOK_ON_LEARN_SPELL,
-        PLAYERHOOK_ON_SET_SKILL
+        PLAYERHOOK_ON_SET_SKILL,
+        PLAYERHOOK_ON_LEVEL_CHANGED,
+        PLAYERHOOK_ON_BEFORE_CRITERIA_PROGRESS
     }) { }
 
     void OnPlayerLogin(Player* player) override
@@ -1208,6 +1296,17 @@ public:
         EnforceAllowedProfessions(player);
         QueueAccountLoad(player, Config.AccountBoundSyncOnLogin);
         NormalizeFreeProfessionPoints(player);
+        RefreshProfessionAchievements(player);
+    }
+
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
+    {
+        RefreshProfessionAchievements(player);
+    }
+
+    bool OnPlayerBeforeCriteriaProgress(Player* player, AchievementCriteriaEntry const* criteria) override
+    {
+        return MeetsProfessionAchievementLevel(player, criteria);
     }
 
     void OnPlayerSave(Player* player) override
@@ -1257,10 +1356,26 @@ public:
     }
 };
 
+// Check individual criteria so core retains its required-count/alternative achievement rules.
+class NoProfessionLimitAchievementScript : public AchievementScript
+{
+public:
+    NoProfessionLimitAchievementScript() : AchievementScript("NoProfessionLimitAchievementScript", {
+        ACHIEVEMENTHOOK_IS_COMPLETED_CRITERIA
+    }) { }
+
+    bool IsCompletedCriteria(AchievementMgr* mgr, AchievementCriteriaEntry const* criteria,
+        AchievementEntry const* /*achievement*/, CriteriaProgress const* /*progress*/) override
+    {
+        return MeetsProfessionAchievementLevel(mgr->GetPlayer(), criteria);
+    }
+};
+
 void AddNoProfessionLimitScripts()
 {
     new NoProfessionLimitWorldScript();
     new NoProfessionLimitPlayerScript();
+    new NoProfessionLimitAchievementScript();
 }
 
 void Addmod_no_profession_limitScripts()

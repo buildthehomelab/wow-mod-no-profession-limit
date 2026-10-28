@@ -77,3 +77,22 @@ If you find this module helpful for your server, please consider giving it a sta
 ## 📜 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+### Profession achievement level requirements
+
+With the module and account-bound progression enabled, profession skill/rank
+achievements wait until the character reaches the minimum trainer level for the
+rank that permits that achievement's threshold. This applies to Hardcore and
+ordinary characters while preserving shared skill values, ranks and recipes.
+Requirements come from the world's `trainer_spell.ReqLevel` rows at startup,
+including trainer spells that teach a rank through a learn-spell wrapper. A rank
+without trainer data is withheld. Restart after changing trainer requirements.
+
+Login and level changes reconsider unawarded profession criteria, including old
+saved counters from account sync. Already awarded achievements are retained.
+Other achievement types and professions outside the configured sync remain
+unchanged. No SQL migration or client patch is needed.
+
+Run the focused production-policy regression harness with
+`python3 tests/test_achievement_levels.py`. It checks rank boundaries, distinct
+trainer requirements, missing data, disabled sync and persisted deferred progress.
