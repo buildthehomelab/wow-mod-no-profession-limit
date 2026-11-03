@@ -22,6 +22,14 @@
 #include "WorldSession.h"
 #include "WorldSessionMgr.h"
 
+// A core with home screens keeps a character row per account that nobody plays. Other cores have none.
+#if __has_include("HomeViewer.h")
+#include "HomeViewer.h"
+#else
+#define SQL_NOT_HOME_VIEWER "1"
+inline bool IsHomeViewer(Player const*) { return false; }
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -796,18 +804,18 @@ void QueueAccountLoad(Player* player, bool applySnapshot)
         "SELECT DISTINCT c.race, cs.spell "
         "FROM character_spell cs "
         "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {}",
+        "WHERE c.account = {} AND " SQL_NOT_HOME_VIEWER,
         accountId);
 
     std::string const skillSql = Acore::StringFormat(
         "SELECT c.race, cs.skill, cs.value, cs.max "
         "FROM character_skills cs "
         "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {} AND cs.skill IN ({})",
+        "WHERE c.account = {} AND " SQL_NOT_HOME_VIEWER " AND cs.skill IN ({})",
         accountId, BuildManagedSkillSqlList());
 
     session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(Acore::StringFormat(
-        "SELECT guid, account, race, class FROM characters WHERE account = {}", accountId))
+        "SELECT guid, account, race, class FROM characters WHERE account = {} AND " SQL_NOT_HOME_VIEWER, accountId))
         .WithChainingCallback([session, guid, data, spellSql](QueryCallback& callback, QueryResult result)
         {
             ReadAccountCharacters(result, data->Characters);
@@ -903,7 +911,7 @@ void FlushAccountSync(Player* player, bool logout)
             return;
 
         if (QueryResult result = CharacterDatabase.Query(
-            "SELECT guid, account, race, class FROM characters WHERE account = {}", player->GetSession()->GetAccountId()))
+            "SELECT guid, account, race, class FROM characters WHERE account = {} AND " SQL_NOT_HOME_VIEWER, player->GetSession()->GetAccountId()))
             ReadAccountCharacters(result, state->Characters);
 
         state->CharactersLoaded = true;
@@ -987,7 +995,7 @@ std::unordered_map<uint32, std::vector<CharacterInfo>> LoadAllCharactersByAccoun
     std::unordered_map<uint32, std::vector<CharacterInfo>> charactersByAccount;
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT guid, account, race, class FROM characters WHERE account <> 0");
+        "SELECT guid, account, race, class FROM characters WHERE account <> 0 AND " SQL_NOT_HOME_VIEWER);
 
     if (!result)
         return charactersByAccount;
@@ -1011,7 +1019,7 @@ void BackfillAllProfessionSkills(std::unordered_map<uint32, std::vector<Characte
         "SELECT c.account, c.guid, c.race, cs.skill, cs.value, cs.max "
         "FROM character_skills cs "
         "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account <> 0 AND cs.skill IN ({})",
+        "WHERE c.account <> 0 AND " SQL_NOT_HOME_VIEWER " AND cs.skill IN ({})",
         BuildManagedSkillSqlList());
 
     if (!result)
@@ -1166,6 +1174,9 @@ public:
         {
             sWorldSessionMgr->DoForAllOnlinePlayers([](Player* player)
             {
+                if (IsHomeViewer(player))
+                    return;
+
                 EnforceAllowedProfessions(player);
                 NormalizeFreeProfessionPoints(player);
 
